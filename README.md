@@ -6,3 +6,9 @@
 ## 数据
 
 以[2019语言与智能技术竞赛](http://lic2019.ccf.org.cn/kg) 的数据作为训练、测试用数据 。
+
+## 模型1
+
+[Enriching Pre-trained Language Model with Entity Information for Relation Classification](https://www.researchgate.net/publication/333353661_Enriching_Pre-trained_Language_Model_with_Entity_Information_for_Relation_Classification)
+
+![模型结构](./tmp/1.png),来源于论文
