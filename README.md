@@ -9,6 +9,10 @@ python3.6
 * tensorflow
 * scikit-learn 
 
+# 中文预训练模型
+
+[Chinese-BERT-wwm] (https://github.com/ymcui/Chinese-BERT-wwm)
+
 
 # 关系抽取
 
@@ -30,3 +34,17 @@ python3.6
 cd ./relation_extract
 python run_classifier_01.py
 ```
+
+## 模型2
+
+TextCnn
+
+
+## 结果
+
+dev集结果
+
+| 序号 | 模型 | precision | recall | f1-score |
+| :-: | :-: | :-: | :-: | :-: |
+| 1 | 模型1 | 0.97 | 0.97 | 0.97 | 
+| 2 | 模型2 |  |  |  |
