@@ -37,7 +37,21 @@ python run_classifier_01.py
 
 ## 模型2
 
-TextCnn
+模型结构，使用TextCnn的基本结构。
+
+![模型结构](./tmp/2.png)
+
+nodes
+
+* 使用Bert的tokenizer进行切字
+* vocabulary与bert相同
+* 分别对字和位置信息进行了embedding，然后拼接
+
+使用模型
+```shell
+cd ./relation_extract
+python run_classifier_02.py
+```
 
 
 ## 结果

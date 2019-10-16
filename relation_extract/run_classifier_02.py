@@ -3,8 +3,47 @@ import os
 import collections
 from sklearn.metrics import f1_score,accuracy_score,recall_score,classification_report
 
-from basic_models import modeling,tokenization,optimization
+from basic_models import cnn,tokenization
 
+
+def get_train_op(init_lr,loss,num_train_steps,num_warmup_steps):
+    global_step=tf.train.get_or_create_global_step()
+    #learning_rate = tf.train.exponential_decay(learning_rate, global_step, self.decay_steps, self.decay_rate, staircase=True)
+    learning_rate = tf.constant(value=init_lr, shape=[], dtype=tf.float32)
+
+    # Implements linear decay of the learning rate.
+    learning_rate = tf.train.polynomial_decay(
+      learning_rate,
+      global_step,
+      num_train_steps,
+      end_learning_rate=0.0,
+      power=1.0,
+      cycle=False)
+
+    # Implements linear warmup. I.e., if global_step < num_warmup_steps, the
+    # learning rate will be `global_step/num_warmup_steps * init_lr`.
+    if num_warmup_steps:
+      global_steps_int = tf.cast(global_step, tf.int32)
+      warmup_steps_int = tf.constant(num_warmup_steps, dtype=tf.int32)
+
+      global_steps_float = tf.cast(global_steps_int, tf.float32)
+      warmup_steps_float = tf.cast(warmup_steps_int, tf.float32)
+
+      warmup_percent_done = global_steps_float / warmup_steps_float
+      warmup_learning_rate = init_lr * warmup_percent_done
+
+      is_warmup = tf.cast(global_steps_int < warmup_steps_int, tf.float32)
+      learning_rate = ((1.0 - is_warmup) * learning_rate + is_warmup * warmup_learning_rate)
+    tf.summary.scalar('learning rate',learning_rate)
+    optimizer = tf.train.AdamOptimizer(learning_rate)
+    gradients, variables = zip(*optimizer.compute_gradients(loss))
+    gradients, _ = tf.clip_by_global_norm(gradients, 5.0)
+    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS) #ADD 2018.06.01
+    with tf.control_dependencies(update_ops):  #ADD 2018.06.01
+        train_op = optimizer.apply_gradients(zip(gradients, variables))
+    new_global_step = global_step + 1
+    train_op = tf.group(train_op, [global_step.assign(new_global_step)])
+    return train_op
 
 class InputExample(object):
     """A single training/test example for simple sequence classification."""
@@ -111,79 +150,30 @@ class BasicProcessor:
             return lines
 
 
-def create_model(bert_config,
-                 is_training,
-                 input_ids,
-                 input_mask,
-                 segment_ids,
-                 e1_mas,
-                 e2_mas,
-                 labels,
-                 num_labels,
-                 use_one_hot_embeddings,
-                 keep_prob=0.9):
+def create_model(input_ids,label_ids,e1_pos,e2_pos,vocab_size,num_labels,is_training,config):
 
-    model = modeling.BertModel(config=bert_config,
-                               is_training=is_training,
-                               input_ids=input_ids,
-                               input_mask=input_mask,
-                               token_type_ids=segment_ids,
-                               use_one_hot_embeddings=use_one_hot_embeddings)
-    cls_layer = model.get_pooled_output()
-    seq_layer = model.get_sequence_output()
-    seq_length = seq_layer.shape[1].value
-    hidden_size = seq_layer.shape[2].value
+    logits=cnn.text_cnn(
+        input_ids=input_ids,
+        e1_pos=e1_pos,
+        e2_pos=e2_pos,
+        max_distance=config.max_distance,
+        keep_prob=config.keep_prob,
+        filter_sizes=config.filter_sizes,
+        num_filters=config.num_filters,
+        pos_embedding_size=config.pos_embedding_size,
+        sequence_length=config.max_seq_length,
+        num_classes=num_labels,
+        is_training=is_training,
+        hidden_size=config.char_embedding_size,
+        vocab_size=vocab_size,
+        l2_reg_lambda=0.0)
+    
+    per_example_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=label_ids)
+    loss = tf.reduce_mean(per_example_loss) 
+    probabilities = tf.nn.softmax(logits, axis=-1)
+    return loss,per_example_loss,logits,probabilities
 
-    if is_training:
-        cls_layer = tf.nn.dropout(cls_layer, keep_prob=keep_prob)
-
-    def get_entity_layer(mask):
-        e_mas = tf.to_float(tf.reshape(mask, [-1, seq_length, 1]))
-        e = tf.multiply(seq_layer, e_mas)
-        e = tf.reduce_sum(e, axis=-2) / tf.maximum(
-            1.0, tf.reduce_sum(tf.to_float(e_mas), axis=-2))
-        e = tf.reshape(e, [-1, hidden_size])
-        if is_training:
-            e = tf.nn.dropout(e, keep_prob=keep_prob)
-        return e
-
-    e1 = get_entity_layer(e1_mas)
-    e2 = get_entity_layer(e2_mas)
-
-    cls_layer = tf.layers.dense(cls_layer,
-                                hidden_size,
-                                activation=tf.nn.tanh,
-                                use_bias=True)
-    e1 = tf.layers.dense(e1, hidden_size, activation=tf.nn.tanh, use_bias=True)
-    e2 = tf.layers.dense(e2, hidden_size, activation=tf.nn.tanh, use_bias=True)
-
-    output_layer = tf.concat([cls_layer, e1, e2], axis=-1)
-
-    if is_training:
-        output_layer = tf.nn.dropout(output_layer, keep_prob=keep_prob)
-
-    logits = tf.layers.dense(output_layer, num_labels, use_bias=True)
-
-    with tf.variable_scope('loss'):
-        probabilities = tf.nn.softmax(logits, axis=-1)
-        log_probs = tf.nn.log_softmax(logits, axis=-1)
-
-        one_hot_labels = tf.one_hot(labels, depth=num_labels, dtype=tf.float32)
-
-        per_example_loss = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
-        loss = tf.reduce_mean(per_example_loss)
-        return (loss, per_example_loss, logits, probabilities)
-
-
-def model_fn_builder(bert_config,
-                     num_labels,
-                     init_checkpoint,
-                     learning_rate,
-                     num_train_steps,
-                     num_warmup_steps,
-                     use_tpu=False,
-                     use_one_hot_embeddings=False,
-                     keep_prob=0.9):
+def model_fn_builder(vocab_size,num_labels,config,num_train_steps,num_warmup_steps):
     """Returns `model_fn` closure for TPUEstimator."""
     def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
         """The `model_fn` for TPUEstimator."""
@@ -194,58 +184,19 @@ def model_fn_builder(bert_config,
                             (name, features[name].shape))
 
         input_ids = features["input_ids"]
-        input_mask = features["input_mask"]
-        segment_ids = features["segment_ids"]
-        e1_mas = features['e1_mas']
-        e2_mas = features['e2_mas']
+        e1_pos = features['e1_pos']
+        e2_pos = features['e2_pos']
         label_ids = features["label_ids"]
-        is_real_example = None
-        if "is_real_example" in features:
-            is_real_example = tf.cast(features["is_real_example"],
-                                      dtype=tf.float32)
-        else:
-            is_real_example = tf.ones(tf.shape(label_ids), dtype=tf.float32)
-
+        
         is_training = (mode == tf.estimator.ModeKeys.TRAIN)
 
         (total_loss, per_example_loss, logits,
-         probabilities) = create_model(bert_config, is_training, input_ids,
-                                       input_mask, segment_ids, e1_mas, e2_mas,
-                                       label_ids, num_labels,
-                                       use_one_hot_embeddings, keep_prob)
-
-        tvars = tf.trainable_variables()
-        initialized_variable_names = {}
-        scaffold_fn = None
-        if init_checkpoint:
-            (assignment_map, initialized_variable_names
-             ) = modeling.get_assignment_map_from_checkpoint(
-                 tvars, init_checkpoint)
-            if use_tpu:
-
-                def tpu_scaffold():
-                    tf.train.init_from_checkpoint(init_checkpoint,
-                                                  assignment_map)
-                    return tf.train.Scaffold()
-
-                scaffold_fn = tpu_scaffold
-            else:
-                tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
-
-        tf.logging.info("**** Trainable Variables ****")
-        for var in tvars:
-            init_string = ""
-            if var.name in initialized_variable_names:
-                init_string = ", *INIT_FROM_CKPT*"
-            tf.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
-                            init_string)
+         probabilities) = create_model(input_ids,label_ids,e1_pos,e2_pos,vocab_size,num_labels,is_training,config)
 
         output_spec = None
         if mode == tf.estimator.ModeKeys.TRAIN:
 
-            train_op = optimization.create_optimizer(total_loss, learning_rate,
-                                                     num_train_steps,
-                                                     num_warmup_steps, use_tpu)
+            train_op = get_train_op(config.learning_rate,total_loss,num_train_steps,num_warmup_steps)
 
             output_spec = tf.estimator.EstimatorSpec(mode=mode,
                                                      loss=total_loss,
@@ -253,7 +204,7 @@ def model_fn_builder(bert_config,
         elif mode == tf.estimator.ModeKeys.EVAL:
 
             def metric_fn(per_example_loss, label_ids, logits,
-                          is_real_example):
+                          is_real_example=False):
                 predictions = tf.argmax(logits, axis=-1, output_type=tf.int32)
                 accuracy = tf.metrics.accuracy(labels=label_ids,
                                                predictions=predictions,
@@ -265,12 +216,8 @@ def model_fn_builder(bert_config,
                     "eval_loss": loss,
                 }
 
-                #eval_metrics = (metric_fn, [
-                per_example_loss, label_ids, logits, is_real_example
-
-            #])
-            eval_metrics = metric_fn(per_example_loss, label_ids, logits,
-                                     is_real_example)
+                
+            eval_metrics = metric_fn(per_example_loss, label_ids, logits)
             output_spec = tf.estimator.EstimatorSpec(
                 mode=mode, loss=total_loss, eval_metric_ops=eval_metrics)
         else:
@@ -294,10 +241,33 @@ class InputFeatures:
         self.e1_mas = e1_mas
         self.e2_mas = e2_mas
         self.label_id = label_id
-
+def get_relative_distance(mapping,lo_start,lo_end,max_distance,max_seq_length):
+  res=[max_distance]*max_seq_length
+  mask=[0]*max_seq_length
+  for i in range(max_seq_length):
+    if i<len(mapping):
+      val=mapping[i]
+      if val<lo_start-max_distance:
+        res[i]=max_distance
+      elif val<lo_start:
+        res[i]=lo_start-val
+      elif val<lo_end:
+        res[i]=0
+      elif val<=lo_end+max_distance:
+        res[i]=val-lo_end+max_distance
+      else:
+        res[i]=2*max_distance
+    else:
+      res[i]=2*max_distance
+  return res
+def prepare_extra_data(mapping_a,locs,max_distance,max_seq_length):
+  entity1_loc,entity2_loc=locs
+  e1_pos=get_relative_distance(mapping_a,entity1_loc[0],entity1_loc[1],max_distance,max_seq_length)
+  e2_pos=get_relative_distance(mapping_a,entity2_loc[0],entity2_loc[1],max_distance,max_seq_length)
+  return e1_pos,e2_pos
 
 def convert_single_example(ex_index, example, label_list, max_seq_length,
-                           tokenizer):
+                           tokenizer,max_distance):
     """Converts a single `InputExample` into a single `InputFeatures`."""
 
     label_map = {}
@@ -309,32 +279,48 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
     e2_pos_start = int(example.e2_pos[0])
     e2_pos_end = int(example.e2_pos[1])
     if len(tokens_a) > max_seq_length - 6:
-        end_max=max(e1_pos_end,e2_pos_end)
-        if end_max>max_seq_length+6:
-            tokens_a=tokens_a[len(tokens_a)-max_seq_length+6:]
-        else:
-            tf.logging.warning("Too long:{}".format(tokens_a))
-            tokens_a = tokens_a[0:max_seq_length - 6]
+        tokens_a = tokens_a[0:max_seq_length - 6]
         tf.logging.warning("Too long:{}".format(tokens_a))
+
+    e1_start=e1_pos_start
+    e1_end=e1_pos_end
+    e2_start=e2_pos_start
+    e2_end=e2_pos_end
+
+    def update_pos(index,e1_start,e1_end,e2_start,e2_end):
+        if index<=e1_pos_start:
+            e1_start+=1
+        if index<e1_pos_end:
+            e1_end+=1
+        if index<=e2_pos_start:
+            e2_start+=1
+        if index<e2_pos_end:
+            e2_end+=1
+        return e1_start,e1_end,e2_start,e2_end
+
     tokens = []
     segment_ids = []
     e1_mas = []
     e2_mas = []
     tokens.append("[CLS]")
+    e1_start,e1_end,e2_start,e2_end=update_pos(0,e1_start,e1_end,e2_start,e2_end)
     segment_ids.append(0)
     e1_mas.append(0)
     e2_mas.append(0)
+
     for i, token in enumerate(tokens_a):
         if i == e1_pos_start:
             tokens.append('$')
             segment_ids.append(0)
             e1_mas.append(0)
             e2_mas.append(0)
+            e1_start,e1_end,e2_start,e2_end=update_pos(i,e1_start,e1_end,e2_start,e2_end)
         elif i == e2_pos_start:
             tokens.append('#')
             segment_ids.append(0)
             e1_mas.append(0)
             e2_mas.append(0)
+            e1_start,e1_end,e2_start,e2_end=update_pos(i,e1_start,e1_end,e2_start,e2_end)
 
         tokens.append(token)
         segment_ids.append(0)
@@ -352,11 +338,15 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
             segment_ids.append(0)
             e1_mas.append(0)
             e2_mas.append(0)
+            e1_start,e1_end,e2_start,e2_end=update_pos(i+1,e1_start,e1_end,e2_start,e2_end)
+          
         elif i + 1 == e2_pos_end:
             tokens.append('#')
             segment_ids.append(0)
             e1_mas.append(0)
             e2_mas.append(0)
+            e1_start,e1_end,e2_start,e2_end=update_pos(i+1,e1_start,e1_end,e2_start,e2_end)
+     
     #print("".join(tokens_a[e1_pos_start:e1_pos_end]))
     #print("".join([i for i,j in zip(tokens,e1_mas) if j==1]))
     #print("".join(tokens_a[e2_pos_start:e2_pos_end]))
@@ -385,6 +375,22 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
     assert len(e2_mas) == max_seq_length
 
     label_id = label_map[example.label]
+
+    mapping_a=list(range(len(input_ids)))
+    e1_pos,e2_pos = prepare_extra_data(mapping_a, [(e1_start,e1_end),(e2_start,e2_end)], max_distance,max_seq_length)
+    
+    #e1=''
+    #for i,j in zip(e1_pos,tokens):
+    #    if i==0:
+    #        e1+=j
+    #print(e1)
+    #e2=''
+    #for i,j in zip(e2_pos,tokens):
+    #    if i==0:
+    #        e2+=j
+    #print(e2)
+    #exit()
+
     if ex_index < 5:
         tf.logging.info("*** Example ***")
         tf.logging.info("guid: %s" % (example.guid))
@@ -405,14 +411,14 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
                             input_mask=input_mask,
                             segment_ids=segment_ids,
                             label_id=label_id,
-                            e1_mas=e1_mas,
-                            e2_mas=e2_mas)
+                            e1_mas=e1_pos,
+                            e2_mas=e2_pos)
     return feature
 
 
 def file_based_convert_examples_to_features(examples, label_list,
                                             max_seq_length, tokenizer,
-                                            output_file):
+                                            output_file,max_distance):
     """Convert a set of `InputExample`s to a TFRecord file."""
 
     writer = tf.python_io.TFRecordWriter(output_file)
@@ -423,7 +429,7 @@ def file_based_convert_examples_to_features(examples, label_list,
                             (ex_index, len(examples)))
 
         feature = convert_single_example(ex_index, example, label_list,
-                                         max_seq_length, tokenizer)
+                                         max_seq_length, tokenizer,max_distance)
 
         def create_int_feature(values):
             f = tf.train.Feature(int64_list=tf.train.Int64List(
@@ -432,11 +438,9 @@ def file_based_convert_examples_to_features(examples, label_list,
 
         features = collections.OrderedDict()
         features["input_ids"] = create_int_feature(feature.input_ids)
-        features["input_mask"] = create_int_feature(feature.input_mask)
-        features["segment_ids"] = create_int_feature(feature.segment_ids)
         features["label_ids"] = create_int_feature([feature.label_id])
-        features["e1_mas"] = create_int_feature(feature.e1_mas)
-        features["e2_mas"] = create_int_feature(feature.e2_mas)
+        features["e1_pos"] = create_int_feature(feature.e1_mas)
+        features["e2_pos"] = create_int_feature(feature.e2_mas)
 
         tf_example = tf.train.Example(features=tf.train.Features(
             feature=features))
@@ -450,11 +454,9 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
 
     name_to_features = {
         "input_ids": tf.FixedLenFeature([seq_length], tf.int64),
-        "input_mask": tf.FixedLenFeature([seq_length], tf.int64),
-        "segment_ids": tf.FixedLenFeature([seq_length], tf.int64),
         "label_ids": tf.FixedLenFeature([], tf.int64),
-        "e1_mas": tf.FixedLenFeature([seq_length], tf.int64),
-        "e2_mas": tf.FixedLenFeature([seq_length], tf.int64),
+        "e1_pos": tf.FixedLenFeature([seq_length], tf.int64),
+        "e2_pos": tf.FixedLenFeature([seq_length], tf.int64),
     }
 
     def _decode_record(record, name_to_features):
@@ -497,19 +499,12 @@ def run(config=None):
     if config is None:
         tf.logging.info("Use default config")
         import basic_config
-        config = basic_config.Config()
+        config = basic_config.CnnConfig()
 
     if not config.do_train and not config.do_eval and not config.do_predict:
         raise ValueError(
             "At least one of 'do_train ,do_eval or do_predict' must be True")
 
-    bert_config = modeling.BertConfig.from_json_file(config.bert_config_file)
-
-    if config.max_seq_length > bert_config.max_position_embeddings:
-        raise ValueError(
-            "Cannot use sequence length %d because the BERT model "
-            "was only trained up to sequence length %d" %
-            (config.max_seq_length, bert_config.max_position_embeddings))
     tf.gfile.MakeDirs(config.output_dir)
 
     processors = {"basic": BasicProcessor}
@@ -539,16 +534,12 @@ def run(config=None):
         ) / config.train_batch_size * config.num_train_epochs
         num_warmup_steps = int(num_train_steps * config.warmup_proportion)
 
-    init_checkpoint = config.bert_init_checkpoint
-    model_fn = model_fn_builder(bert_config,
-                                len(label_list),
-                                init_checkpoint,
-                                config.learning_rate,
-                                num_train_steps,
-                                num_warmup_steps,
-                                False,
-                                False,
-                                keep_prob=config.keep_prob)
+    model_fn = model_fn_builder(
+        vocab_size=len(tokenizer.vocab),
+        num_labels=len(processor.labels),
+        config=config,
+        num_train_steps=num_train_steps,
+        num_warmup_steps=num_warmup_steps)
     estimator = tf.estimator.Estimator(model_fn=model_fn,
                                        model_dir=config.output_dir,
                                        config=run_config)
@@ -562,7 +553,7 @@ def run(config=None):
         file_based_convert_examples_to_features(processor.train_examples,
                                                 label_list,
                                                 config.max_seq_length,
-                                                tokenizer, train_file)
+                                                tokenizer, train_file,config.max_distance)
         train_input_fn = file_based_input_fn_builder(
             input_file=train_file,
             seq_length=config.max_seq_length,
@@ -578,7 +569,7 @@ def run(config=None):
         file_based_convert_examples_to_features(processor.eval_examples,
                                                 label_list,
                                                 config.max_seq_length,
-                                                tokenizer, eval_file)
+                                                tokenizer, eval_file,config.max_distance)
         eval_input_fn = file_based_input_fn_builder(
             input_file=eval_file,
             seq_length=config.max_seq_length,
@@ -602,7 +593,7 @@ def run(config=None):
         file_based_convert_examples_to_features(processor.eval_examples,
                                                 label_list,
                                                 config.max_seq_length,
-                                                tokenizer, eval_file)
+                                                tokenizer, eval_file,config.max_distance)
         eval_input_fn = file_based_input_fn_builder(
             input_file=eval_file,
             seq_length=config.max_seq_length,
